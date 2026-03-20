@@ -9,10 +9,7 @@ export default {
     const blockedRegions = ['CN', 'HK', 'MO'];
     
     if (blockedRegions.includes(country)) {
-      return new Response(`Access Denied: Your region (${country}) is not allowed for OpenAI registration.`, { 
-        status: 403,
-        headers: { 'Content-Type': 'text/plain' }
-      });
+      return new Response(`Access Denied: Your region (${country}) is not allowed.`, { status: 403 });
     }
 
     // 2. 特殊功能：获取当前 Worker 的出口 IP
@@ -21,7 +18,11 @@ export default {
       const data = await resp.json();
       data.worker_country = country;
       return new Response(JSON.stringify(data), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+          'X-IP-Rotation': Math.random().toString(36).substring(7)
+        }
       });
     }
 
@@ -31,24 +32,27 @@ export default {
     }
 
     try {
+      // 随机化 X-Forwarded-For 诱导边缘节点切换
+      const randomIp = () => Array.from({length: 4}, () => Math.floor(Math.random() * 255)).join('.');
+      
+      const modifiedHeaders = new Headers(request.headers);
+      modifiedHeaders.set('X-Forwarded-For', randomIp());
+      modifiedHeaders.set('X-Real-IP', randomIp());
+      modifiedHeaders.delete('cf-connecting-ip');
+      
       const modifiedRequest = new Request(targetUrl, {
         method: request.method,
-        headers: request.headers,
+        headers: modifiedHeaders,
         body: request.body,
         redirect: 'follow'
       });
 
-      // 清理可能导致拦截的 Header
-      modifiedRequest.headers.delete('cf-connecting-ip');
-      modifiedRequest.headers.delete('x-real-ip');
-      modifiedRequest.headers.delete('forwarded');
-
       const response = await fetch(modifiedRequest);
       const newResponse = new Response(response.body, response);
       
-      // 允许跨域
       newResponse.headers.set('Access-Control-Allow-Origin', '*');
       newResponse.headers.set('X-Worker-Region', country);
+      newResponse.headers.set('Cache-Control', 'no-store');
       
       return newResponse;
     } catch (e) {
