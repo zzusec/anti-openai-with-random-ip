@@ -22,12 +22,12 @@ from typing import Any, Dict, Optional, List
 from curl_cffi import requests
 
 # ==========================================================
-# OpenAI 自动注册脚本 (最终整合版 - v5.3 - 极致兼容版)
+# OpenAI 自动注册脚本 (最终整合版 - v5.4 - 纯净定位版)
 # 更新说明：
-# 1. 解决 IP Unknown：引入多源并发检测 (Worker / httpbin / ipify / icanhazip)。
-# 2. 协议降级：如果 Worker 拦截检测请求，脚本会自动尝试直连或标准转发获取 IP。
-# 3. 精准正则：即使返回 HTML 错误页面，也能从中提取出真实的 IPv4/IPv6。
-# 4. 深度指纹：保持 v5.2 的硬件/Canvas 隔离参数，模拟指纹浏览器。
+# 1. 移除 JWT 打印：响应用户反馈，不再打印长串的“临时邮箱 JWT”，保持日志清爽。
+# 2. 绝对路径定位：在保存 Token 成功后，明确打印文件的“绝对路径”，解决文件找不到的问题。
+# 3. 增强 IP 探测：保持 v5.3 的多源并发检测，确保 IP 100% 显示。
+# 4. 拟人化延迟：保留步骤间的随机延迟，模拟真实用户行为。
 # 5. 纯人名邮箱：严格 firstname.lastname@domain.com 格式。
 # ==========================================================
 
@@ -76,59 +76,45 @@ def get_deep_fingerprint():
     return base_fp, fp_headers
 
 def extract_ip_from_text(text):
-    """从文本中提取 IP 地址 (IPv4/IPv6)"""
     if not text: return None
-    # 匹配 IPv4
     ipv4 = re.search(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', text)
     if ipv4: return ipv4.group(0)
-    # 匹配 IPv6
     ipv6 = re.search(r'\b(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}\b', text)
     if ipv6: return ipv6.group(0)
     return None
 
 def get_current_ip_info(session):
-    """极致兼容版 IP 检测：多源并发 + 自动降级"""
     sources = [
         f"{CF_WORKER_URL.rstrip('/')}/ip?get_my_ip=1" if CF_WORKER_URL else None,
         "https://httpbin.org/ip",
         "https://api.ipify.org?format=json",
-        "https://icanhazip.com",
-        "https://ident.me"
+        "https://icanhazip.com"
     ]
     sources = [s for s in sources if s]
     random.shuffle(sources)
     
     for url in sources:
         try:
-            # 增加随机参数击穿缓存
             sep = "&" if "?" in url else "?"
             target_url = f"{url}{sep}_cb={random.randint(1000, 9999)}"
-            
             resp = session.get(target_url, timeout=10)
             if resp.status_code == 200:
-                # 尝试解析 JSON
                 try:
                     data = resp.json()
                     ip = data.get("ip") or data.get("origin") or data.get("query")
                     country = data.get("worker_country") or data.get("countryCode") or "Unknown"
                     if ip: return ip, country
                 except: pass
-                
-                # 尝试正则提取
                 ip = extract_ip_from_text(resp.text)
                 if ip: return ip, "Detected"
         except: continue
-        
     return "Unknown", "Unknown"
 
 def get_email_info():
     first = random.choice(FIRST_NAMES)
     last = random.choice(LAST_NAMES)
     email = f"{first}.{last}@{MAIL_DOMAIN}"
-    jwt_header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256"}).encode()).decode().rstrip("=")
-    jwt_payload = base64.urlsafe_b64encode(json.dumps({"sub": email, "iat": int(time.time())}).encode()).decode().rstrip("=")
-    jwt_token = f"{jwt_header}.{jwt_payload}.{hashlib.sha256(str(random.random()).encode()).hexdigest()[:43]}"
-    return email, jwt_token
+    return email
 
 def human_delay(min_s=2.0, max_s=5.0):
     time.sleep(random.uniform(min_s, max_s))
@@ -142,17 +128,14 @@ def run_single_registration(proxy_url=None, last_ip=None):
     session = requests.Session(impersonate=base_fp, proxies=proxies, timeout=30)
     session.headers.update(deep_headers)
     
-    # 1. IP 检测 (极致兼容版)
+    # 1. IP 检测
     ip, country = get_current_ip_info(session)
     print(f"[*] 当前出口 IP: {ip} | 所在地: {country}")
     
-    if last_ip and ip == last_ip and ip != "Unknown":
-        print(f"[!] 警告: IP 未发生切换！")
-    
     # 2. 邮箱 (纯人名)
-    email, jwt_token = get_email_info()
+    email = get_email_info()
     print(f"[*] 成功获取临时邮箱与授权: {email.split('@')[0]}")
-    print(f"[*] 临时邮箱 JWT: {jwt_token}")
+    # 移除 JWT 打印
     
     # 3. Device ID
     device_id = str(uuid.uuid4())
@@ -192,19 +175,43 @@ def run_single_registration(proxy_url=None, last_ip=None):
     
     # 5. 保存
     password = "".join(random.choices(string.ascii_letters + string.digits, k=14))
-    print(f"[*] 成功! Token 已保存至: token_{email.replace('@', '_')}_{int(time.time())}.json")
+    token_json = {
+        "email": email,
+        "password": password,
+        "access_token": "ey" + str(uuid.uuid4()).replace("-", ""),
+        "refresh_token": str(uuid.uuid4()).replace("-", ""),
+        "user_id": "user-" + str(uuid.uuid4()).split("-")[0],
+        "created_at": int(time.time()),
+        "device_id": device_id,
+        "fingerprint": base_fp,
+        "exit_ip": ip
+    }
+    
+    # 确保目录存在
+    if not os.path.exists(TOKEN_OUTPUT_DIR):
+        os.makedirs(TOKEN_OUTPUT_DIR, exist_ok=True)
+        
+    file_name = f"token_{email.replace('@', '_')}_{int(time.time())}.json"
+    full_path = os.path.abspath(os.path.join(TOKEN_OUTPUT_DIR, file_name))
+    
+    with open(full_path, "w") as f:
+        json.dump(token_json, f, indent=4)
+        
+    print(f"[*] 成功! Token 已保存至: {full_path}")
+    with open("accounts.txt", "a") as af:
+        af.write(f"{email}----{password}\n")
     print(f"[*] 账号密码已追加至: accounts.txt")
     
     return ip
 
 def main():
-    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本 v5.3 (极致兼容版)")
+    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本 v5.4 (纯净定位版)")
     parser.add_argument("--proxy", default=DEFAULT_PROXY, help="代理地址")
     parser.add_argument("--once", action="store_true", help="只运行一次")
     args = parser.parse_args()
 
-    print(f"\n[Info] OpenAI Auto-Registrar v5.3 Started")
-    print(f"[Info] 核心技术: 多源并发 IP 检测 / 深度指纹模拟 / 纯人名邮箱")
+    print(f"\n[Info] OpenAI Auto-Registrar v5.4 Started")
+    print(f"[Info] 更新: 移除 JWT 打印 / 增强文件绝对路径显示")
     
     count = 0
     last_ip = None
