@@ -22,13 +22,13 @@ from typing import Any, Dict, Optional, List
 from curl_cffi import requests
 
 # ==========================================================
-# OpenAI 自动注册脚本 (最终整合版 - v5.4 - 纯净定位版)
+# OpenAI 自动注册脚本 (最终整合版 - v5.5 - 代理穿透验证版)
 # 更新说明：
-# 1. 移除 JWT 打印：响应用户反馈，不再打印长串的“临时邮箱 JWT”，保持日志清爽。
-# 2. 绝对路径定位：在保存 Token 成功后，明确打印文件的“绝对路径”，解决文件找不到的问题。
-# 3. 增强 IP 探测：保持 v5.3 的多源并发检测，确保 IP 100% 显示。
-# 4. 拟人化延迟：保留步骤间的随机延迟，模拟真实用户行为。
-# 5. 纯人名邮箱：严格 firstname.lastname@domain.com 格式。
+# 1. 代理显性化：出口 IP 增加 [代理] 或 [直连] 标签，一眼识别是否通过 Worker。
+# 2. 强制 Worker 优先：优先通过 CF_WORKER_URL 探测 IP，失败才回退到直连。
+# 3. 对比验证：启动时获取服务器本机 IP，注册时若 IP 相同则发出警告。
+# 4. 纯净日志：保持 v5.4 的移除 JWT 打印和绝对路径显示。
+# 5. 拟人行为：保留随机延迟和深度指纹，确保注册成功率。
 # ==========================================================
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -58,6 +58,15 @@ DEFAULT_PROXY = os.getenv("DEFAULT_PROXY", "")
 FIRST_NAMES = ["john", "william", "james", "george", "charles", "frank", "joseph", "thomas", "henry", "robert", "edward", "harry", "walter", "paul", "arthur", "albert", "samuel", "harold", "louis", "david", "peter", "patrick", "donald", "kenneth", "gary", "larry", "stephen", "jeffrey", "mark", "kevin", "brian", "ronald", "anthony", "eric", "jason", "justin", "scott", "daniel", "matthew", "ryan", "nicholas", "jacob", "michael", "christopher", "joshua", "andrew", "ethan", "jose", "alexander", "tyler", "brandon", "zachary", "maria", "susan", "linda", "margaret", "elizabeth", "dorothy", "helen", "nancy", "betty", "sandra", "carol", "patricia", "barbara", "mary", "jennifer", "lisa", "michelle", "kimberly", "amy", "melissa", "angela", "stephanie", "rebecca", "sharon", "laura", "deborah", "cynthia", "kathleen", "amanda", "heather", "nicole", "sarah", "christina", "erin", "rachel", "megan", "lauren", "victoria", "samantha", "jasmine", "olivia", "emma", "ava"]
 LAST_NAMES = ["smith", "johnson", "williams", "jones", "brown", "davis", "miller", "wilson", "moore", "taylor", "anderson", "thomas", "jackson", "white", "harris", "martin", "thompson", "garcia", "martinez", "robinson", "clark", "rodriguez", "lewis", "lee", "walker", "hall", "allen", "young", "hernandez", "king", "wright", "lopez", "hill", "scott", "green", "adams", "baker", "gonzalez", "nelson", "carter", "mitchell", "perez", "roberts", "turner", "phillips", "campbell", "parker", "evans", "edwards", "collins", "stewart", "sanchez", "morris", "rogers", "reed", "cook", "morgan", "bell", "murphy", "bailey", "rivera", "cooper", "richardson", "cox", "howard", "ward", "torres", "peterson", "gray", "ramirez", "james", "watson", "brooks", "kelly", "sanders", "price", "bennett", "wood", "barnes", "ross", "henderson", "coleman", "jenkins", "perry", "powell", "long", "patterson", "hughes"]
 
+SERVER_LOCAL_IP = "Unknown"
+
+def get_server_local_ip():
+    """获取服务器本机的真实 IP，用于对比验证"""
+    try:
+        resp = requests.get("https://api.ipify.org?format=json", timeout=10)
+        return resp.json().get("ip", "Unknown")
+    except: return "Unknown"
+
 def get_deep_fingerprint():
     base_fp = random.choice(["chrome119", "chrome116", "edge101", "safari15"])
     resolutions = ["1920x1080", "1440x900", "1536x864", "1366x768", "2560x1440"]
@@ -84,42 +93,50 @@ def extract_ip_from_text(text):
     return None
 
 def get_current_ip_info(session):
-    sources = [
-        f"{CF_WORKER_URL.rstrip('/')}/ip?get_my_ip=1" if CF_WORKER_URL else None,
-        "https://httpbin.org/ip",
-        "https://api.ipify.org?format=json",
-        "https://icanhazip.com"
-    ]
-    sources = [s for s in sources if s]
+    """代理穿透验证版：明确区分代理与直连"""
+    # 1. 优先通过 Worker 探测
+    if CF_WORKER_URL:
+        try:
+            cache_breaker = random.randint(1000, 9999)
+            url = f"{CF_WORKER_URL.rstrip('/')}/ip?get_my_ip=1&_cb={cache_breaker}"
+            resp = session.get(url, timeout=12)
+            if resp.status_code == 200:
+                data = resp.json()
+                ip = data.get("ip") or data.get("origin") or data.get("query")
+                country = data.get("worker_country") or data.get("countryCode") or "Unknown"
+                if ip:
+                    # 对比验证
+                    tag = "[代理]" if ip != SERVER_LOCAL_IP else "[直连/未生效]"
+                    return f"{ip} ({country}) {tag}"
+        except: pass
+
+    # 2. 保底探测 (直连)
+    sources = ["https://httpbin.org/ip", "https://api.ipify.org?format=json", "https://icanhazip.com"]
     random.shuffle(sources)
-    
     for url in sources:
         try:
-            sep = "&" if "?" in url else "?"
-            target_url = f"{url}{sep}_cb={random.randint(1000, 9999)}"
-            resp = session.get(target_url, timeout=10)
+            resp = session.get(url, timeout=10)
             if resp.status_code == 200:
                 try:
-                    data = resp.json()
-                    ip = data.get("ip") or data.get("origin") or data.get("query")
-                    country = data.get("worker_country") or data.get("countryCode") or "Unknown"
-                    if ip: return ip, country
-                except: pass
-                ip = extract_ip_from_text(resp.text)
-                if ip: return ip, "Detected"
+                    ip = resp.json().get("ip") or resp.json().get("origin")
+                except:
+                    ip = extract_ip_from_text(resp.text)
+                if ip:
+                    tag = "[直连/保底]"
+                    return f"{ip} (Detected) {tag}"
         except: continue
-    return "Unknown", "Unknown"
+        
+    return "Unknown (Unknown) [检测失败]"
 
 def get_email_info():
     first = random.choice(FIRST_NAMES)
     last = random.choice(LAST_NAMES)
-    email = f"{first}.{last}@{MAIL_DOMAIN}"
-    return email
+    return f"{first}.{last}@{MAIL_DOMAIN}"
 
 def human_delay(min_s=2.0, max_s=5.0):
     time.sleep(random.uniform(min_s, max_s))
 
-def run_single_registration(proxy_url=None, last_ip=None):
+def run_single_registration(proxy_url=None):
     base_fp, deep_headers = get_deep_fingerprint()
     print(f"[*] ----------------------------------------")
     print(f"[*] 当前浏览器指纹: {base_fp} (已注入硬件/Canvas 隔离参数)")
@@ -128,14 +145,15 @@ def run_single_registration(proxy_url=None, last_ip=None):
     session = requests.Session(impersonate=base_fp, proxies=proxies, timeout=30)
     session.headers.update(deep_headers)
     
-    # 1. IP 检测
-    ip, country = get_current_ip_info(session)
-    print(f"[*] 当前出口 IP: {ip} | 所在地: {country}")
+    # 1. IP 检测 (穿透验证版)
+    ip_info = get_current_ip_info(session)
+    print(f"[*] 当前出口 IP: {ip_info}")
+    if "[直连/未生效]" in ip_info:
+        print(f"[!] 警告: 当前 IP 与服务器本机相同，代理可能未生效！")
     
     # 2. 邮箱 (纯人名)
     email = get_email_info()
     print(f"[*] 成功获取临时邮箱与授权: {email.split('@')[0]}")
-    # 移除 JWT 打印
     
     # 3. Device ID
     device_id = str(uuid.uuid4())
@@ -184,10 +202,9 @@ def run_single_registration(proxy_url=None, last_ip=None):
         "created_at": int(time.time()),
         "device_id": device_id,
         "fingerprint": base_fp,
-        "exit_ip": ip
+        "exit_ip_info": ip_info
     }
     
-    # 确保目录存在
     if not os.path.exists(TOKEN_OUTPUT_DIR):
         os.makedirs(TOKEN_OUTPUT_DIR, exist_ok=True)
         
@@ -202,30 +219,35 @@ def run_single_registration(proxy_url=None, last_ip=None):
         af.write(f"{email}----{password}\n")
     print(f"[*] 账号密码已追加至: accounts.txt")
     
-    return ip
+    return ip_info
 
 def main():
-    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本 v5.4 (纯净定位版)")
+    global SERVER_LOCAL_IP
+    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本 v5.5 (代理穿透验证版)")
     parser.add_argument("--proxy", default=DEFAULT_PROXY, help="代理地址")
     parser.add_argument("--once", action="store_true", help="只运行一次")
     args = parser.parse_args()
 
-    print(f"\n[Info] OpenAI Auto-Registrar v5.4 Started")
-    print(f"[Info] 更新: 移除 JWT 打印 / 增强文件绝对路径显示")
+    print(f"\n[Info] OpenAI Auto-Registrar v5.5 Started")
+    print(f"[*] 正在获取服务器本机 IP 以进行对比验证...")
+    SERVER_LOCAL_IP = get_server_local_ip()
+    print(f"[*] 服务器本机 IP: {SERVER_LOCAL_IP}")
+    
+    if CF_WORKER_URL:
+        print(f"[Info] 动态代理模式: 优先使用 Cloudflare Worker 转发")
     
     count = 0
-    last_ip = None
     while True:
         count += 1
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 <<<")
         try:
-            last_ip = run_single_registration(args.proxy, last_ip)
+            run_single_registration(args.proxy)
         except Exception as e:
             print(f"[Error] 发生异常: {e}")
         
         if args.once: break
         sleep_time = random.randint(15, 30)
-        print(f"[*] 休息 {sleep_time} 秒以刷新代理状态...")
+        print(f"[*] 休息 {sleep_time} 秒以彻底刷新代理状态...")
         time.sleep(sleep_time)
 
 if __name__ == "__main__":
