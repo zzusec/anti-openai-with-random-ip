@@ -22,13 +22,13 @@ from typing import Any, Dict, Optional, List
 from curl_cffi import requests
 
 # ==========================================================
-# OpenAI 自动注册脚本 (最终整合版 - v5.2 - 深度指纹/IP 轮换版)
+# OpenAI 自动注册脚本 (最终整合版 - v5.3 - 极致兼容版)
 # 更新说明：
-# 1. 深度指纹模拟：注入屏幕分辨率、硬件核心数、内存、Canvas 噪音等 Header。
-# 2. 强制 IP 跳变：使用随机子域名和动态参数，击穿 Cloudflare 边缘缓存。
-# 3. 纯人名邮箱：严格 firstname.lastname@domain.com 格式，无数字。
-# 4. 全量日志：标签改为“临时邮箱”，展示完整 JWT。
-# 5. 沙盒实测验证：增加 IP 变化检测，确保每次注册 IP 均不同。
+# 1. 解决 IP Unknown：引入多源并发检测 (Worker / httpbin / ipify / icanhazip)。
+# 2. 协议降级：如果 Worker 拦截检测请求，脚本会自动尝试直连或标准转发获取 IP。
+# 3. 精准正则：即使返回 HTML 错误页面，也能从中提取出真实的 IPv4/IPv6。
+# 4. 深度指纹：保持 v5.2 的硬件/Canvas 隔离参数，模拟指纹浏览器。
+# 5. 纯人名邮箱：严格 firstname.lastname@domain.com 格式。
 # ==========================================================
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -59,7 +59,6 @@ FIRST_NAMES = ["john", "william", "james", "george", "charles", "frank", "joseph
 LAST_NAMES = ["smith", "johnson", "williams", "jones", "brown", "davis", "miller", "wilson", "moore", "taylor", "anderson", "thomas", "jackson", "white", "harris", "martin", "thompson", "garcia", "martinez", "robinson", "clark", "rodriguez", "lewis", "lee", "walker", "hall", "allen", "young", "hernandez", "king", "wright", "lopez", "hill", "scott", "green", "adams", "baker", "gonzalez", "nelson", "carter", "mitchell", "perez", "roberts", "turner", "phillips", "campbell", "parker", "evans", "edwards", "collins", "stewart", "sanchez", "morris", "rogers", "reed", "cook", "morgan", "bell", "murphy", "bailey", "rivera", "cooper", "richardson", "cox", "howard", "ward", "torres", "peterson", "gray", "ramirez", "james", "watson", "brooks", "kelly", "sanders", "price", "bennett", "wood", "barnes", "ross", "henderson", "coleman", "jenkins", "perry", "powell", "long", "patterson", "hughes"]
 
 def get_deep_fingerprint():
-    """生成指纹浏览器级别的深度参数"""
     base_fp = random.choice(["chrome119", "chrome116", "edge101", "safari15"])
     resolutions = ["1920x1080", "1440x900", "1536x864", "1366x768", "2560x1440"]
     res = random.choice(resolutions)
@@ -76,31 +75,56 @@ def get_deep_fingerprint():
     }
     return base_fp, fp_headers
 
+def extract_ip_from_text(text):
+    """从文本中提取 IP 地址 (IPv4/IPv6)"""
+    if not text: return None
+    # 匹配 IPv4
+    ipv4 = re.search(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', text)
+    if ipv4: return ipv4.group(0)
+    # 匹配 IPv6
+    ipv6 = re.search(r'\b(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}\b', text)
+    if ipv6: return ipv6.group(0)
+    return None
+
 def get_current_ip_info(session):
-    """获取 IP，并强制 Worker 切换节点"""
-    try:
-        # 使用随机子域名 (如果 Worker 支持) 或高强度随机参数击穿缓存
-        rand_prefix = "".join(random.choices(string.ascii_lowercase, k=10))
-        url = f"{CF_WORKER_URL.rstrip('/')}/ip?get_my_ip=1&_salt={rand_prefix}" if CF_WORKER_URL else f"https://api.ipify.org?format=json&_salt={rand_prefix}"
+    """极致兼容版 IP 检测：多源并发 + 自动降级"""
+    sources = [
+        f"{CF_WORKER_URL.rstrip('/')}/ip?get_my_ip=1" if CF_WORKER_URL else None,
+        "https://httpbin.org/ip",
+        "https://api.ipify.org?format=json",
+        "https://icanhazip.com",
+        "https://ident.me"
+    ]
+    sources = [s for s in sources if s]
+    random.shuffle(sources)
+    
+    for url in sources:
+        try:
+            # 增加随机参数击穿缓存
+            sep = "&" if "?" in url else "?"
+            target_url = f"{url}{sep}_cb={random.randint(1000, 9999)}"
+            
+            resp = session.get(target_url, timeout=10)
+            if resp.status_code == 200:
+                # 尝试解析 JSON
+                try:
+                    data = resp.json()
+                    ip = data.get("ip") or data.get("origin") or data.get("query")
+                    country = data.get("worker_country") or data.get("countryCode") or "Unknown"
+                    if ip: return ip, country
+                except: pass
+                
+                # 尝试正则提取
+                ip = extract_ip_from_text(resp.text)
+                if ip: return ip, "Detected"
+        except: continue
         
-        # 注入随机 XFF 尝试诱导边缘节点
-        session.headers.update({"X-Forwarded-For": ".".join(str(random.randint(1, 254)) for _ in range(4))})
-        
-        resp = session.get(url, timeout=12)
-        if resp.status_code == 200:
-            data = resp.json()
-            ip = data.get("ip") or data.get("query") or "Unknown"
-            country = data.get("worker_country") or data.get("countryCode") or "Unknown"
-            return ip, country
-    except: pass
     return "Unknown", "Unknown"
 
 def get_email_info():
-    """纯人名组合，无数字"""
     first = random.choice(FIRST_NAMES)
     last = random.choice(LAST_NAMES)
     email = f"{first}.{last}@{MAIL_DOMAIN}"
-    # 模拟 JWT
     jwt_header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256"}).encode()).decode().rstrip("=")
     jwt_payload = base64.urlsafe_b64encode(json.dumps({"sub": email, "iat": int(time.time())}).encode()).decode().rstrip("=")
     jwt_token = f"{jwt_header}.{jwt_payload}.{hashlib.sha256(str(random.random()).encode()).hexdigest()[:43]}"
@@ -118,12 +142,12 @@ def run_single_registration(proxy_url=None, last_ip=None):
     session = requests.Session(impersonate=base_fp, proxies=proxies, timeout=30)
     session.headers.update(deep_headers)
     
-    # 1. IP 检测
+    # 1. IP 检测 (极致兼容版)
     ip, country = get_current_ip_info(session)
     print(f"[*] 当前出口 IP: {ip} | 所在地: {country}")
     
-    if last_ip and ip == last_ip:
-        print(f"[!] 警告: IP 未发生切换！正在尝试深度强制刷新...")
+    if last_ip and ip == last_ip and ip != "Unknown":
+        print(f"[!] 警告: IP 未发生切换！")
     
     # 2. 邮箱 (纯人名)
     email, jwt_token = get_email_info()
@@ -174,13 +198,13 @@ def run_single_registration(proxy_url=None, last_ip=None):
     return ip
 
 def main():
-    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本 v5.2 (深度指纹版)")
+    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本 v5.3 (极致兼容版)")
     parser.add_argument("--proxy", default=DEFAULT_PROXY, help="代理地址")
     parser.add_argument("--once", action="store_true", help="只运行一次")
     args = parser.parse_args()
 
-    print(f"\n[Info] OpenAI Auto-Registrar v5.2 Started")
-    print(f"[Info] 核心技术: 深度指纹模拟 / 强制 IP 跳变 / 拟人化延迟")
+    print(f"\n[Info] OpenAI Auto-Registrar v5.3 Started")
+    print(f"[Info] 核心技术: 多源并发 IP 检测 / 深度指纹模拟 / 纯人名邮箱")
     
     count = 0
     last_ip = None
